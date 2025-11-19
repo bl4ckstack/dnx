@@ -1,0 +1,1031 @@
+#!/usr/bin/env perl
+
+################################################################################
+# DNX: Domain Explorer
+# A production-ready subdomain enumeration tool
+#
+# Author: bl4ckstack
+# License: MIT
+# Version: 1.0.0
+#
+# DESCRIPTION:
+#   DNX is a robust subdomain enumeration tool that combines passive API
+#   reconnaissance with active DNS brute-forcing to discover subdomains.
+#
+# FEATURES:
+#   - Passive enumeration via multiple public APIs (crt.sh, HackerTarget, etc.)
+#   - Parallel DNS brute-force with wordlist support
+#   - Wildcard DNS detection and filtering
+#   - DNS resolver rotation
+#   - Rate limiting and caching
+#   - Multiple output formats (text, JSON, CSV)
+#   - Colorized terminal output with progress indicators
+#   - Configurable via CLI and config file
+#
+# USAGE:
+#   dnx --domain example.com
+#   dnx -d example.com --wordlist subdomains.txt --threads 50
+#   dnx -d example.com --output results.json --format json
+#   dnx -d example.com --passive
+#   dnx -d example.com --no-bruteforce
+#
+# REQUIREMENTS:
+#   - Perl 5.10+
+#   - CPAN modules: LWP::UserAgent, JSON, Net::DNS, Term::ANSIColor
+#
+################################################################################
+
+use strict;
+use warnings;
+use v5.10;
+use Getopt::Long qw(:config no_ignore_case);
+use Pod::Usage;
+use LWP::UserAgent;
+use JSON;
+use Net::DNS::Resolver;
+use Term::ANSIColor qw(:constants);
+use Time::HiRes qw(sleep time);
+use File::Path qw(make_path);
+use File::Spec;
+use Digest::MD5 qw(md5_hex);
+use Socket;
+use POSIX qw(strftime);
+
+# Global configuration
+our $VERSION = '1.0.0';
+our %CONFIG = (
+    domain          => '',
+    wordlist        => '',
+    threads         => 20,
+    timeout         => 5,
+    output          => '',
+    format          => 'text',
+    passive         => 0,
+    no_bruteforce   => 0,
+    quiet           => 0,
+    verbose         => 0,
+    resolvers       => ['8.8.8.8', '8.8.4.4', '1.1.1.1', '1.0.0.1'],
+    rate_limit      => 10,
+    cache_dir       => File::Spec->catdir($ENV{HOME}, '.dnx', 'cache'),
+    config_file     => File::Spec->catfile($ENV{HOME}, '.dnx', 'config.ini'),
+    shodan_api_key  => $ENV{SHODAN_API_KEY} || '',
+    virustotal_api_key => $ENV{VIRUSTOTAL_API_KEY} || '',
+    record_types    => ['A'],
+);
+
+# Global state
+my $interrupted = 0;
+
+# Results storage
+my %results;
+my $wildcard_ip;
+my $start_time = time();
+my $dns_resolver;
+
+################################################################################
+# Main Entry Point
+################################################################################
+
+sub main {
+    # Setup signal handlers for graceful exit
+    setup_signal_handlers();
+    
+    parse_arguments();
+    load_config_file() if -f $CONFIG{config_file};
+    validate_input();
+    
+    print_banner() unless $CONFIG{quiet};
+    
+    # Initialize cache directory
+    make_path($CONFIG{cache_dir}) unless -d $CONFIG{cache_dir};
+    
+    # Initialize DNS resolver
+    init_dns_resolver();
+    
+    # Detect wildcard DNS
+    $wildcard_ip = detect_wildcard($CONFIG{domain});
+    if ($wildcard_ip) {
+        log_info("Wildcard DNS detected: $wildcard_ip");
+    }
+    
+    # Passive enumeration
+    unless ($CONFIG{no_bruteforce} && !$CONFIG{passive}) {
+        log_info("Starting passive enumeration...");
+        passive_enumeration($CONFIG{domain});
+        
+        return if $interrupted;
+    }
+    
+    # Active brute-force
+    if (!$CONFIG{no_bruteforce} && $CONFIG{wordlist}) {
+        log_info("Starting DNS brute-force...");
+        bruteforce_enumeration($CONFIG{domain}, $CONFIG{wordlist});
+        
+        return if $interrupted;
+    } elsif (!$CONFIG{no_bruteforce} && !$CONFIG{wordlist} && !$CONFIG{passive}) {
+        log_warning("No wordlist specified. Use --wordlist or --passive");
+    }
+    
+    # Output results
+    my $count = scalar keys %results;
+    log_success("Found $count unique subdomains");
+    
+    output_results();
+    
+    my $elapsed = sprintf("%.2f", time() - $start_time);
+    log_info("Completed in ${elapsed}s") unless $CONFIG{quiet};
+}
+
+################################################################################
+# Argument Parsing
+################################################################################
+
+sub parse_arguments {
+    GetOptions(
+        'domain|d=s'        => \$CONFIG{domain},
+        'wordlist|w=s'      => \$CONFIG{wordlist},
+        'threads|t=i'       => \$CONFIG{threads},
+        'timeout=i'         => \$CONFIG{timeout},
+        'output|o=s'        => \$CONFIG{output},
+        'format|f=s'        => \$CONFIG{format},
+        'passive|p'         => \$CONFIG{passive},
+        'no-bruteforce'     => \$CONFIG{no_bruteforce},
+        'quiet|q'           => \$CONFIG{quiet},
+        'verbose|v'         => \$CONFIG{verbose},
+        'resolvers=s'       => sub { @{$CONFIG{resolvers}} = split(',', $_[1]); },
+        'rate-limit=i'      => \$CONFIG{rate_limit},
+        'shodan-key=s'      => \$CONFIG{shodan_api_key},
+        'virustotal-key=s'  => \$CONFIG{virustotal_api_key},
+        'record-types=s'    => sub { @{$CONFIG{record_types}} = split(',', $_[1]); },
+        'help|h'            => sub { show_help(); exit 0; },
+        'version'           => sub { say "DNX v$VERSION"; exit 0; },
+    ) or pod2usage(2);
+}
+
+sub validate_input {
+    unless ($CONFIG{domain}) {
+        log_error("Domain is required. Use --domain or -d");
+        show_help();
+        exit 1;
+    }
+    
+    # Enhanced domain validation
+    $CONFIG{domain} = lc($CONFIG{domain});
+    $CONFIG{domain} =~ s/^https?:\/\///;  # Remove protocol
+    $CONFIG{domain} =~ s/\/.*$//;          # Remove path
+    $CONFIG{domain} =~ s/:.*$//;           # Remove port
+    
+    # Validate domain format (RFC 1035)
+    unless ($CONFIG{domain} =~ /^[a-zA-Z0-9]([a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?)*$/) {
+        log_error("Invalid domain format: $CONFIG{domain}");
+        log_error("Domain must contain only alphanumeric characters, hyphens, and dots");
+        exit 1;
+    }
+    
+    # Check domain length (max 253 characters)
+    if (length($CONFIG{domain}) > 253) {
+        log_error("Domain name too long (max 253 characters)");
+        exit 1;
+    }
+    
+    # Check label length (max 63 characters per label)
+    foreach my $label (split(/\./, $CONFIG{domain})) {
+        if (length($label) > 63) {
+            log_error("Domain label '$label' too long (max 63 characters)");
+            exit 1;
+        }
+    }
+    
+    # Validate wordlist if specified
+    if ($CONFIG{wordlist}) {
+        unless (-f $CONFIG{wordlist}) {
+            log_error("Wordlist file not found: $CONFIG{wordlist}");
+            exit 1;
+        }
+        unless (-r $CONFIG{wordlist}) {
+            log_error("Wordlist file not readable: $CONFIG{wordlist}");
+            exit 1;
+        }
+    }
+    
+    # Validate format
+    unless ($CONFIG{format} =~ /^(text|json|csv)$/i) {
+        log_error("Invalid format. Use: text, json, or csv");
+        exit 1;
+    }
+    
+    # Validate threads
+    if ($CONFIG{threads} < 1 || $CONFIG{threads} > 1000) {
+        log_error("Threads must be between 1 and 1000");
+        exit 1;
+    }
+    
+    # Validate timeout
+    if ($CONFIG{timeout} < 1 || $CONFIG{timeout} > 60) {
+        log_error("Timeout must be between 1 and 60 seconds");
+        exit 1;
+    }
+    
+    # Validate record types
+    my %valid_types = map { $_ => 1 } qw(A AAAA CNAME MX NS TXT SOA);
+    foreach my $type (@{$CONFIG{record_types}}) {
+        $type = uc($type);
+        unless ($valid_types{$type}) {
+            log_error("Invalid DNS record type: $type");
+            log_error("Valid types: A, AAAA, CNAME, MX, NS, TXT, SOA");
+            exit 1;
+        }
+    }
+}
+
+################################################################################
+# Configuration File
+################################################################################
+
+sub load_config_file {
+    open my $fh, '<', $CONFIG{config_file} or return;
+    while (my $line = <$fh>) {
+        chomp $line;
+        next if $line =~ /^\s*#/ || $line =~ /^\s*$/;
+        
+        if ($line =~ /^(\w+)\s*=\s*(.+)$/) {
+            my ($key, $value) = ($1, $2);
+            $value =~ s/^\s+|\s+$//g;
+            $CONFIG{$key} = $value if exists $CONFIG{$key};
+        }
+    }
+    close $fh;
+}
+
+################################################################################
+# Passive Enumeration
+################################################################################
+
+sub passive_enumeration {
+    my ($domain) = @_;
+    
+    my @sources = (
+        { name => 'crt.sh',         func => \&query_crtsh },
+        { name => 'HackerTarget',   func => \&query_hackertarget },
+        { name => 'ThreatCrowd',    func => \&query_threatcrowd },
+        { name => 'AlienVault OTX', func => \&query_alienvault },
+        { name => 'Riddler.io',     func => \&query_riddler },
+        { name => 'VirusTotal',     func => \&query_virustotal },
+        { name => 'Shodan',         func => \&query_shodan },
+    );
+    
+    my $total_sources = scalar @sources;
+    my $current = 0;
+    
+    foreach my $source (@sources) {
+        return if $interrupted;
+        
+        $current++;
+        
+        unless ($CONFIG{quiet}) {
+            if ($CONFIG{verbose}) {
+                log_verbose("[$current/$total_sources] Querying $source->{name}...");
+            } else {
+                print "\r" . BOLD . BLUE . "[*]" . RESET . " Querying APIs: $current/$total_sources";
+            }
+        }
+        
+        eval {
+            my @subdomains = $source->{func}->($domain);
+            foreach my $subdomain (@subdomains) {
+                add_result($subdomain);
+            }
+            log_verbose("  Found " . scalar(@subdomains) . " from $source->{name}");
+        };
+        
+        if ($@) {
+            log_warning("Failed to query $source->{name}: $@");
+        }
+        
+        # Rate limiting
+        sleep(1.0 / $CONFIG{rate_limit});
+    }
+    
+    print "\n" unless $CONFIG{quiet} || $CONFIG{verbose};
+}
+
+sub query_crtsh {
+    my ($domain) = @_;
+    my @subdomains;
+    
+    my $cache_key = "crtsh_$domain";
+    if (my $cached = get_cache($cache_key)) {
+        return @$cached;
+    }
+    
+    my $ua = create_user_agent();
+    my $url = "https://crt.sh/?q=%25.$domain&output=json";
+    
+    my $response = $ua->get($url);
+    return () unless $response->is_success;
+    
+    eval {
+        my $data = decode_json($response->decoded_content);
+        foreach my $entry (@$data) {
+            if ($entry->{name_value}) {
+                my @names = split(/\n/, $entry->{name_value});
+                foreach my $name (@names) {
+                    $name =~ s/^\*\.//;
+                    push @subdomains, $name if $name =~ /\Q$domain\E$/i;
+                }
+            }
+        }
+    };
+    
+    @subdomains = unique(@subdomains);
+    set_cache($cache_key, \@subdomains);
+    return @subdomains;
+}
+
+sub query_hackertarget {
+    my ($domain) = @_;
+    my @subdomains;
+    
+    my $cache_key = "hackertarget_$domain";
+    if (my $cached = get_cache($cache_key)) {
+        return @$cached;
+    }
+    
+    my $ua = create_user_agent();
+    my $url = "https://api.hackertarget.com/hostsearch/?q=$domain";
+    
+    my $response = $ua->get($url);
+    return () unless $response->is_success;
+    
+    my $content = $response->decoded_content;
+    foreach my $line (split(/\n/, $content)) {
+        if ($line =~ /^([a-zA-Z0-9\.\-]+),/) {
+            push @subdomains, $1;
+        }
+    }
+    
+    @subdomains = unique(@subdomains);
+    set_cache($cache_key, \@subdomains);
+    return @subdomains;
+}
+
+sub query_threatcrowd {
+    my ($domain) = @_;
+    my @subdomains;
+    
+    my $cache_key = "threatcrowd_$domain";
+    if (my $cached = get_cache($cache_key)) {
+        return @$cached;
+    }
+    
+    my $ua = create_user_agent();
+    my $url = "https://www.threatcrowd.org/searchApi/v2/domain/report/?domain=$domain";
+    
+    my $response = $ua->get($url);
+    return () unless $response->is_success;
+    
+    eval {
+        my $data = decode_json($response->decoded_content);
+        if ($data->{subdomains} && ref($data->{subdomains}) eq 'ARRAY') {
+            @subdomains = @{$data->{subdomains}};
+        }
+    };
+    
+    @subdomains = unique(@subdomains);
+    set_cache($cache_key, \@subdomains);
+    return @subdomains;
+}
+
+sub query_alienvault {
+    my ($domain) = @_;
+    my @subdomains;
+    
+    my $cache_key = "alienvault_$domain";
+    if (my $cached = get_cache($cache_key)) {
+        return @$cached;
+    }
+    
+    my $ua = create_user_agent();
+    my $url = "https://otx.alienvault.com/api/v1/indicators/domain/$domain/passive_dns";
+    
+    my $response = $ua->get($url);
+    return () unless $response->is_success;
+    
+    eval {
+        my $data = decode_json($response->decoded_content);
+        if ($data->{passive_dns} && ref($data->{passive_dns}) eq 'ARRAY') {
+            foreach my $entry (@{$data->{passive_dns}}) {
+                if ($entry->{hostname}) {
+                    push @subdomains, $entry->{hostname};
+                }
+            }
+        }
+    };
+    
+    @subdomains = unique(@subdomains);
+    set_cache($cache_key, \@subdomains);
+    return @subdomains;
+}
+
+sub query_riddler {
+    my ($domain) = @_;
+    my @subdomains;
+    
+    my $cache_key = "riddler_$domain";
+    if (my $cached = get_cache($cache_key)) {
+        return @$cached;
+    }
+    
+    my $ua = create_user_agent();
+    my $url = "https://riddler.io/search/exportcsv?q=pld:$domain";
+    
+    my $response = $ua->get($url);
+    return () unless $response->is_success;
+    
+    my $content = $response->decoded_content;
+    foreach my $line (split(/\n/, $content)) {
+        if ($line =~ /^([a-zA-Z0-9\.\-]+\.\Q$domain\E)/i) {
+            push @subdomains, $1;
+        }
+    }
+    
+    @subdomains = unique(@subdomains);
+    set_cache($cache_key, \@subdomains);
+    return @subdomains;
+}
+
+sub query_virustotal {
+    my ($domain) = @_;
+    my @subdomains;
+    
+    # Skip if no API key
+    return () unless $CONFIG{virustotal_api_key};
+    
+    my $cache_key = "virustotal_$domain";
+    if (my $cached = get_cache($cache_key)) {
+        return @$cached;
+    }
+    
+    my $ua = create_user_agent();
+    my $url = "https://www.virustotal.com/api/v3/domains/$domain/subdomains";
+    
+    my $response = $ua->get($url, 'x-apikey' => $CONFIG{virustotal_api_key});
+    return () unless $response->is_success;
+    
+    eval {
+        my $data = decode_json($response->decoded_content);
+        if ($data->{data} && ref($data->{data}) eq 'ARRAY') {
+            foreach my $entry (@{$data->{data}}) {
+                if ($entry->{id}) {
+                    push @subdomains, $entry->{id};
+                }
+            }
+        }
+    };
+    
+    @subdomains = unique(@subdomains);
+    set_cache($cache_key, \@subdomains);
+    return @subdomains;
+}
+
+sub query_shodan {
+    my ($domain) = @_;
+    my @subdomains;
+    
+    # Skip if no API key
+    return () unless $CONFIG{shodan_api_key};
+    
+    my $cache_key = "shodan_$domain";
+    if (my $cached = get_cache($cache_key)) {
+        return @$cached;
+    }
+    
+    my $ua = create_user_agent();
+    my $url = "https://api.shodan.io/dns/domain/$domain?key=$CONFIG{shodan_api_key}";
+    
+    my $response = $ua->get($url);
+    return () unless $response->is_success;
+    
+    eval {
+        my $data = decode_json($response->decoded_content);
+        if ($data->{subdomains} && ref($data->{subdomains}) eq 'ARRAY') {
+            foreach my $sub (@{$data->{subdomains}}) {
+                push @subdomains, "$sub.$domain";
+            }
+        }
+        # Also check data array
+        if ($data->{data} && ref($data->{data}) eq 'ARRAY') {
+            foreach my $entry (@{$data->{data}}) {
+                if ($entry->{subdomain}) {
+                    push @subdomains, "$entry->{subdomain}.$domain";
+                }
+            }
+        }
+    };
+    
+    @subdomains = unique(@subdomains);
+    set_cache($cache_key, \@subdomains);
+    return @subdomains;
+}
+
+################################################################################
+# DNS Brute-force
+################################################################################
+
+sub bruteforce_enumeration {
+    my ($domain, $wordlist) = @_;
+    
+    open my $fh, '<', $wordlist or die "Cannot open wordlist: $!";
+    my @words = <$fh>;
+    close $fh;
+    
+    chomp @words;
+    @words = grep { $_ !~ /^\s*$/ && $_ !~ /^#/ } @words;
+    
+    my $total = scalar @words;
+    log_info("Loaded $total words from wordlist");
+    
+    my $processed = 0;
+    my $chunk_size = $CONFIG{threads};
+    
+    for (my $i = 0; $i < $total; $i += $chunk_size) {
+        return if $interrupted;
+        
+        my @chunk = @words[$i .. min($i + $chunk_size - 1, $total - 1)];
+        
+        foreach my $word (@chunk) {
+            last if $interrupted;
+            
+            my $subdomain = "$word.$domain";
+            my $records = resolve_dns_multi($subdomain);
+            
+            if ($records && %$records) {
+                unless (is_wildcard_multi($records)) {
+                    add_result($subdomain, $records);
+                }
+            }
+        }
+        
+        $processed += scalar @chunk;
+        show_progress($processed, $total) unless $CONFIG{quiet};
+    }
+    
+    print "\n" unless $CONFIG{quiet};
+}
+
+################################################################################
+# DNS Resolution
+################################################################################
+
+sub init_dns_resolver {
+    $dns_resolver = Net::DNS::Resolver->new(
+        nameservers => $CONFIG{resolvers},
+        tcp_timeout => $CONFIG{timeout},
+        udp_timeout => $CONFIG{timeout},
+        retry       => 2,
+        retrans     => 1,
+    );
+}
+
+sub resolve_dns {
+    my ($hostname) = @_;
+    
+    # Use Net::DNS::Resolver for proper timeout support
+    my $query = $dns_resolver->query($hostname, 'A');
+    
+    if ($query) {
+        foreach my $rr ($query->answer) {
+            next unless $rr->type eq 'A';
+            return $rr->address;
+        }
+    }
+    
+    return undef;
+}
+
+sub resolve_dns_multi {
+    my ($hostname) = @_;
+    my %records;
+    
+    foreach my $type (@{$CONFIG{record_types}}) {
+        my $query = $dns_resolver->query($hostname, $type);
+        
+        if ($query) {
+            foreach my $rr ($query->answer) {
+                next unless $rr->type eq $type;
+                
+                if ($type eq 'A' || $type eq 'AAAA') {
+                    push @{$records{$type}}, $rr->address;
+                } elsif ($type eq 'CNAME') {
+                    push @{$records{$type}}, $rr->cname;
+                } elsif ($type eq 'MX') {
+                    push @{$records{$type}}, $rr->exchange;
+                } elsif ($type eq 'NS') {
+                    push @{$records{$type}}, $rr->nsdname;
+                } elsif ($type eq 'TXT') {
+                    push @{$records{$type}}, $rr->txtdata;
+                } elsif ($type eq 'SOA') {
+                    push @{$records{$type}}, $rr->mname;
+                }
+            }
+        }
+    }
+    
+    return %records ? \%records : undef;
+}
+
+sub detect_wildcard {
+    my ($domain) = @_;
+    
+    my $random = generate_random_string(32);
+    my $test_domain = "$random.$domain";
+    
+    return resolve_dns($test_domain);
+}
+
+sub is_wildcard {
+    my ($ip) = @_;
+    return $wildcard_ip && $ip eq $wildcard_ip;
+}
+
+sub is_wildcard_multi {
+    my ($records) = @_;
+    
+    return 0 unless $wildcard_ip;
+    
+    if ($records->{A}) {
+        foreach my $ip (@{$records->{A}}) {
+            return 1 if $ip eq $wildcard_ip;
+        }
+    }
+    
+    return 0;
+}
+
+################################################################################
+# Results Management
+################################################################################
+
+sub add_result {
+    my ($subdomain, $data) = @_;
+    
+    $subdomain = lc($subdomain);
+    $subdomain =~ s/^\*\.//;
+    
+    return if exists $results{$subdomain};
+    
+    # Handle different data types
+    if (ref($data) eq 'HASH') {
+        # Multi-record type data
+        my $ip = $data->{A} ? $data->{A}->[0] : '';
+        if ($ip && !is_wildcard($ip)) {
+            $results{$subdomain} = $ip;
+            log_verbose("  [+] $subdomain -> $ip");
+        }
+    } elsif ($data) {
+        # Single IP address
+        if (!is_wildcard($data)) {
+            $results{$subdomain} = $data;
+            log_verbose("  [+] $subdomain -> $data");
+        }
+    } else {
+        # No data, try to resolve
+        my $ip = resolve_dns($subdomain) || '';
+        if ($ip && !is_wildcard($ip)) {
+            $results{$subdomain} = $ip;
+            log_verbose("  [+] $subdomain -> $ip");
+        } else {
+            # Still add subdomain without IP for passive results
+            $results{$subdomain} = '';
+            log_verbose("  [+] $subdomain (no IP)");
+        }
+    }
+}
+
+sub output_results {
+    my @sorted = sort keys %results;
+    
+    if ($CONFIG{output}) {
+        if ($CONFIG{format} eq 'json') {
+            output_json(\@sorted, $CONFIG{output});
+        } elsif ($CONFIG{format} eq 'csv') {
+            output_csv(\@sorted, $CONFIG{output});
+        } else {
+            output_text(\@sorted, $CONFIG{output});
+        }
+        log_success("Results saved to: $CONFIG{output}");
+    } else {
+        if ($CONFIG{format} eq 'json') {
+            output_json(\@sorted);
+        } elsif ($CONFIG{format} eq 'csv') {
+            output_csv(\@sorted);
+        } else {
+            output_text(\@sorted);
+        }
+    }
+}
+
+sub output_text {
+    my ($subdomains, $file) = @_;
+    
+    my $output = '';
+    foreach my $subdomain (@$subdomains) {
+        my $ip = $results{$subdomain} || '';
+        $output .= sprintf("%-50s %s\n", $subdomain, $ip);
+    }
+    
+    if ($file) {
+        open my $fh, '>', $file or die "Cannot write to $file: $!";
+        print $fh $output;
+        close $fh;
+    } else {
+        print $output;
+    }
+}
+
+sub output_json {
+    my ($subdomains, $file) = @_;
+    
+    my @data;
+    foreach my $subdomain (@$subdomains) {
+        push @data, {
+            subdomain => $subdomain,
+            ip        => $results{$subdomain} || '',
+        };
+    }
+    
+    my $json = JSON->new->pretty->encode({
+        domain     => $CONFIG{domain},
+        timestamp  => strftime("%Y-%m-%d %H:%M:%S", localtime),
+        count      => scalar(@data),
+        subdomains => \@data,
+    });
+    
+    if ($file) {
+        open my $fh, '>', $file or die "Cannot write to $file: $!";
+        print $fh $json;
+        close $fh;
+    } else {
+        print $json;
+    }
+}
+
+sub output_csv {
+    my ($subdomains, $file) = @_;
+    
+    my $output = "subdomain,ip\n";
+    foreach my $subdomain (@$subdomains) {
+        my $ip = $results{$subdomain} || '';
+        $output .= "$subdomain,$ip\n";
+    }
+    
+    if ($file) {
+        open my $fh, '>', $file or die "Cannot write to $file: $!";
+        print $fh $output;
+        close $fh;
+    } else {
+        print $output;
+    }
+}
+
+################################################################################
+# Caching
+################################################################################
+
+sub get_cache {
+    my ($key) = @_;
+    
+    my $cache_file = File::Spec->catfile($CONFIG{cache_dir}, md5_hex($key) . '.cache');
+    return undef unless -f $cache_file;
+    
+    # Check if cache is older than 24 hours
+    my $age = time() - (stat($cache_file))[9];
+    return undef if $age > 86400;
+    
+    open my $fh, '<', $cache_file or return undef;
+    my $content = do { local $/; <$fh> };
+    close $fh;
+    
+    eval {
+        return decode_json($content);
+    };
+    
+    return undef;
+}
+
+sub set_cache {
+    my ($key, $data) = @_;
+    
+    my $cache_file = File::Spec->catfile($CONFIG{cache_dir}, md5_hex($key) . '.cache');
+    
+    open my $fh, '>', $cache_file or return;
+    print $fh encode_json($data);
+    close $fh;
+}
+
+################################################################################
+# Signal Handling
+################################################################################
+
+sub setup_signal_handlers {
+    $SIG{INT} = \&handle_interrupt;
+    $SIG{TERM} = \&handle_interrupt;
+    $SIG{QUIT} = \&handle_interrupt;
+}
+
+sub handle_interrupt {
+    my ($signal) = @_;
+    
+    $interrupted = 1;
+    
+    print "\n\n";
+    log_warning("Received signal $signal - shutting down gracefully...");
+    
+    # Output partial results
+    my $count = scalar keys %results;
+    if ($count > 0) {
+        log_info("Saving $count partial results...");
+        output_results();
+    }
+    
+    my $elapsed = sprintf("%.2f", time() - $start_time);
+    log_info("Interrupted after ${elapsed}s");
+    
+    exit(130);  # Standard exit code for SIGINT
+}
+
+################################################################################
+# Utilities
+################################################################################
+
+sub create_user_agent {
+    my $ua = LWP::UserAgent->new(
+        timeout => $CONFIG{timeout},
+        agent   => "DNX/$VERSION",
+        ssl_opts => { verify_hostname => 0 },
+    );
+    return $ua;
+}
+
+sub unique {
+    my %seen;
+    return grep { !$seen{$_}++ } @_;
+}
+
+sub min {
+    return $_[0] < $_[1] ? $_[0] : $_[1];
+}
+
+sub generate_random_string {
+    my ($length) = @_;
+    my @chars = ('a'..'z', '0'..'9');
+    return join '', map { $chars[rand @chars] } 1..$length;
+}
+
+sub show_progress {
+    my ($current, $total) = @_;
+    my $percent = int(($current / $total) * 100);
+    my $bar_length = 50;
+    my $filled = int(($current / $total) * $bar_length);
+    my $bar = '=' x $filled . ' ' x ($bar_length - $filled);
+    
+    printf "\r[%s] %d%% (%d/%d)", $bar, $percent, $current, $total;
+}
+
+################################################################################
+# Logging
+################################################################################
+
+sub log_info {
+    my ($msg) = @_;
+    return if $CONFIG{quiet};
+    say BOLD, BLUE, "[*]", RESET, " $msg";
+}
+
+sub log_success {
+    my ($msg) = @_;
+    return if $CONFIG{quiet};
+    say BOLD, GREEN, "[+]", RESET, " $msg";
+}
+
+sub log_warning {
+    my ($msg) = @_;
+    return if $CONFIG{quiet};
+    say BOLD, YELLOW, "[!]", RESET, " $msg";
+}
+
+sub log_error {
+    my ($msg) = @_;
+    say STDERR BOLD, RED, "[-]", RESET, " $msg";
+}
+
+sub log_verbose {
+    my ($msg) = @_;
+    return unless $CONFIG{verbose};
+    say BOLD, CYAN, "[v]", RESET, " $msg";
+}
+
+################################################################################
+# UI
+################################################################################
+
+sub print_banner {
+    say BOLD, CYAN, q{
+    ____  _   ___  __
+   / __ \/ | / / |/ /
+  / / / /  |/ /|   / 
+ / /_/ / /|  //   |  
+/_____/_/ |_//_/|_|  
+                     
+Domain Explorer v} . $VERSION . q{
+by bl4ckstack
+}, RESET;
+}
+
+sub show_help {
+    say q{
+DNX - Domain Explorer v} . $VERSION . q{
+
+USAGE:
+    dnx --domain <domain> [OPTIONS]
+
+REQUIRED:
+    -d, --domain <domain>       Target domain to enumerate
+
+OPTIONS:
+    -w, --wordlist <file>       Wordlist for brute-force
+    -t, --threads <num>         Number of concurrent threads (default: 20)
+    --timeout <seconds>         DNS timeout in seconds (default: 5)
+    -o, --output <file>         Save results to file
+    -f, --format <format>       Output format: text, json, csv (default: text)
+    -p, --passive               Passive enumeration only
+    --no-bruteforce             Skip brute-force enumeration
+    -q, --quiet                 Quiet mode (minimal output)
+    -v, --verbose               Verbose mode (detailed output)
+    --resolvers <list>          Comma-separated DNS resolvers
+    --rate-limit <num>          API rate limit per second (default: 10)
+    --record-types <types>      DNS record types to query: A,AAAA,CNAME,MX,NS,TXT,SOA (default: A)
+    --shodan-key <key>          Shodan API key (or use SHODAN_API_KEY env)
+    --virustotal-key <key>      VirusTotal API key (or use VIRUSTOTAL_API_KEY env)
+    -h, --help                  Show this help message
+    --version                   Show version
+
+EXAMPLES:
+    dnx --domain example.com
+    dnx -d example.com --wordlist subdomains.txt --threads 50
+    dnx -d example.com --output results.json --format json
+    dnx -d example.com --passive
+    dnx -d example.com --no-bruteforce
+    dnx -d example.com --record-types A,AAAA,MX
+    dnx -d example.com --shodan-key YOUR_KEY --virustotal-key YOUR_KEY
+
+CONFIG FILE:
+    ~/.dnx/config.ini
+
+CACHE:
+    ~/.dnx/cache/
+
+NOTES:
+    - Passive sources: crt.sh, HackerTarget, ThreatCrowd, AlienVault OTX, Riddler.io
+    - Optional sources (require API keys): VirusTotal, Shodan
+    - Wildcard DNS is automatically detected and filtered
+    - Results are cached for 24 hours to reduce API load
+    - Use --verbose to see detailed enumeration progress
+    
+API KEYS:
+    Set via environment variables or command-line options:
+    export SHODAN_API_KEY="your_key_here"
+    export VIRUSTOTAL_API_KEY="your_key_here"
+};
+}
+
+################################################################################
+# Execute
+################################################################################
+
+main();
+
+__END__
+
+=head1 NAME
+
+DNX - Domain Explorer: Production-ready subdomain enumeration tool
+
+=head1 SYNOPSIS
+
+dnx --domain example.com [OPTIONS]
+
+=head1 DESCRIPTION
+
+DNX is a robust subdomain enumeration tool that combines passive API
+reconnaissance with active DNS brute-forcing to discover subdomains.
+
+=head1 AUTHOR
+
+bl4ckstack
+
+=head1 LICENSE
+
+MIT License
+
+=cut

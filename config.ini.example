@@ -1,0 +1,32 @@
+# DNX Configuration File
+# Copy this file to ~/.dnx/config.ini to use
+
+# Number of concurrent threads for DNS brute-force
+threads = 20
+
+# DNS timeout in seconds
+timeout = 5
+
+# API rate limit (requests per second)
+rate_limit = 10
+
+# Default output format (text, json, csv)
+format = text
+
+# Custom DNS resolvers (comma-separated)
+# Uncomment and modify to use custom resolvers
+# resolvers = 8.8.8.8,8.8.4.4,1.1.1.1,1.0.0.1,9.9.9.9
+
+# Default wordlist path
+# wordlist = /path/to/your/wordlist.txt
+
+# API Keys (optional - for enhanced enumeration)
+# Get your keys from:
+# - Shodan: https://account.shodan.io/
+# - VirusTotal: https://www.virustotal.com/gui/my-apikey
+
+# Shodan API key
+# shodan_api_key = YOUR_SHODAN_API_KEY_HERE
+
+# VirusTotal API key
+# virustotal_api_key = YOUR_VIRUSTOTAL_API_KEY_HERE
