@@ -633,7 +633,7 @@ Pull requests welcome for:
 A: Perl is ubiquitous, fast for text processing, and the entire tool is a single self-contained script. No compilation needed.
 
 **Q: How many API keys do I need?**  
-A: None required! 7 sources work without keys. Add keys for VirusTotal, Shodan, and SecurityTrails to access 3 more premium sources.
+A: None required! 27 sources work without keys. Add keys for VirusTotal, Shodan, and SecurityTrails to access 3 more premium sources.
 
 **Q: Is DNX better than Amass?**  
 A: Different tools for different needs. Amass has 10x more sources and enterprise features. DNX is simpler, lighter, and includes active enumeration + takeover checks in one tool.
