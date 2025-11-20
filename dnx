@@ -48,6 +48,7 @@ use Time::HiRes qw(sleep time);
 use File::Path qw(make_path);
 use File::Spec;
 use Digest::MD5 qw(md5_hex);
+use MIME::Base64;
 use Socket;
 use POSIX qw(strftime);
 
@@ -70,7 +71,13 @@ our %CONFIG = (
     config_file     => File::Spec->catfile($ENV{HOME}, '.dnx', 'config.ini'),
     shodan_api_key  => $ENV{SHODAN_API_KEY} || '',
     virustotal_api_key => $ENV{VIRUSTOTAL_API_KEY} || '',
+    securitytrails_api_key => $ENV{SECURITYTRAILS_API_KEY} || '',
     record_types    => ['A'],
+    recursive       => 0,
+    recursion_depth => 3,
+    zone_transfer   => 0,
+    http_probe      => 0,
+    takeover_check  => 0,
 );
 
 # Global state
@@ -78,9 +85,14 @@ my $interrupted = 0;
 
 # Results storage
 my %results;
+my %http_status;
+my %takeover_vulnerable;
 my $wildcard_ip;
 my $start_time = time();
 my $dns_resolver;
+
+# Enable autoflush for immediate output
+$| = 1;
 
 ################################################################################
 # Main Entry Point
@@ -108,6 +120,16 @@ sub main {
         log_info("Wildcard DNS detected: $wildcard_ip");
     }
     
+    # Zone transfer attempt
+    if ($CONFIG{zone_transfer}) {
+        log_info("Attempting DNS zone transfer...");
+        my @zone_subs = attempt_zone_transfer($CONFIG{domain});
+        foreach my $sub (@zone_subs) {
+            add_result($sub);
+        }
+        return if $interrupted;
+    }
+    
     # Passive enumeration
     unless ($CONFIG{no_bruteforce} && !$CONFIG{passive}) {
         log_info("Starting passive enumeration...");
@@ -124,6 +146,51 @@ sub main {
         return if $interrupted;
     } elsif (!$CONFIG{no_bruteforce} && !$CONFIG{wordlist} && !$CONFIG{passive}) {
         log_warning("No wordlist specified. Use --wordlist or --passive");
+    }
+    
+    # Recursive enumeration
+    if ($CONFIG{recursive}) {
+        log_info("Starting recursive enumeration...");
+        recursive_enumeration($CONFIG{domain}, $CONFIG{recursion_depth});
+        
+        return if $interrupted;
+    }
+    
+    # HTTP probing
+    if ($CONFIG{http_probe}) {
+        log_info("Probing HTTP services...");
+        my @subs = keys %results;
+        my $total = scalar @subs;
+        my $current = 0;
+        
+        foreach my $sub (@subs) {
+            return if $interrupted;
+            $current++;
+            probe_http($sub);
+            show_progress($current, $total) unless $CONFIG{quiet};
+        }
+        print "\n" unless $CONFIG{quiet};
+    }
+    
+    # Subdomain takeover check
+    if ($CONFIG{takeover_check}) {
+        log_info("Checking for subdomain takeovers...");
+        my @subs = keys %results;
+        my $total = scalar @subs;
+        my $current = 0;
+        
+        foreach my $sub (@subs) {
+            return if $interrupted;
+            $current++;
+            check_subdomain_takeover($sub);
+            show_progress($current, $total) unless $CONFIG{quiet};
+        }
+        print "\n" unless $CONFIG{quiet};
+        
+        my $vuln_count = scalar keys %takeover_vulnerable;
+        if ($vuln_count > 0) {
+            log_warning("Found $vuln_count potential subdomain takeovers!");
+        }
     }
     
     # Output results
@@ -156,7 +223,13 @@ sub parse_arguments {
         'rate-limit=i'      => \$CONFIG{rate_limit},
         'shodan-key=s'      => \$CONFIG{shodan_api_key},
         'virustotal-key=s'  => \$CONFIG{virustotal_api_key},
+        'securitytrails-key=s' => \$CONFIG{securitytrails_api_key},
         'record-types=s'    => sub { @{$CONFIG{record_types}} = split(',', $_[1]); },
+        'recursive|r'       => \$CONFIG{recursive},
+        'recursion-depth=i' => \$CONFIG{recursion_depth},
+        'zone-transfer|z'   => \$CONFIG{zone_transfer},
+        'http-probe'        => \$CONFIG{http_probe},
+        'takeover-check'    => \$CONFIG{takeover_check},
         'help|h'            => sub { show_help(); exit 0; },
         'version'           => sub { say "DNX v$VERSION"; exit 0; },
     ) or pod2usage(2);
@@ -272,6 +345,39 @@ sub passive_enumeration {
         { name => 'Riddler.io',     func => \&query_riddler },
         { name => 'VirusTotal',     func => \&query_virustotal },
         { name => 'Shodan',         func => \&query_shodan },
+        { name => 'SecurityTrails', func => \&query_securitytrails },
+        { name => 'BufferOver',     func => \&query_bufferover },
+        { name => 'URLScan',        func => \&query_urlscan },
+        { name => 'CertSpotter',    func => \&query_certspotter },
+        { name => 'Anubis',         func => \&query_anubis },
+        { name => 'ThreatMiner',    func => \&query_threatminer },
+        { name => 'DNSDumpster',    func => \&query_dnsdumpster },
+        { name => 'RapidDNS',       func => \&query_rapiddns },
+        { name => 'Sublist3r API',  func => \&query_sublist3r },
+        { name => 'CertDB',         func => \&query_certdb },
+        { name => 'Chaos',          func => \&query_chaos },
+        { name => 'Spyse',          func => \&query_spyse },
+        { name => 'BinaryEdge',     func => \&query_binaryedge },
+        { name => 'Censys',         func => \&query_censys },
+        { name => 'FullHunt',       func => \&query_fullhunt },
+        { name => 'Netlas',         func => \&query_netlas },
+        { name => 'LeakIX',         func => \&query_leakix },
+        { name => 'Fofa',           func => \&query_fofa },
+        { name => 'ZoomEye',        func => \&query_zoomeye },
+        { name => 'Hunter',         func => \&query_hunter },
+        { name => 'Wayback',        func => \&query_wayback },
+        { name => 'CommonCrawl',    func => \&query_commoncrawl },
+        { name => 'GitHub',         func => \&query_github },
+        { name => 'Crtsh Alt',      func => \&query_crtsh_alt },
+        { name => 'Sonar',          func => \&query_sonar },
+        { name => 'Omnisint',       func => \&query_omnisint },
+        { name => 'ProjectDiscovery', func => \&query_projectdiscovery },
+        { name => 'Rapiddns.io',    func => \&query_rapiddns_io },
+        { name => 'DNS.BufferOver', func => \&query_dns_bufferover },
+        { name => 'CertificateSearch', func => \&query_certificatesearch },
+        { name => 'Crt.sh JSON',    func => \&query_crtsh_json },
+        { name => 'Web Archive',    func => \&query_webarchive },
+        { name => 'VirusTotal Web', func => \&query_virustotal_web },
     );
     
     my $total_sources = scalar @sources;
@@ -286,7 +392,22 @@ sub passive_enumeration {
             if ($CONFIG{verbose}) {
                 log_verbose("[$current/$total_sources] Querying $source->{name}...");
             } else {
-                print "\r" . BOLD . BLUE . "[*]" . RESET . " Querying APIs: $current/$total_sources";
+                # Show simple progress with spinner
+                my @spinner = ('⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏');
+                my $spin = $spinner[$current % 10];
+                my $percent = int(($current / $total_sources) * 100);
+                
+                # Create progress bar
+                my $bar_width = 40;
+                my $filled = int(($current / $total_sources) * $bar_width);
+                my $bar = '█' x $filled . '░' x ($bar_width - $filled);
+                
+                my $progress_msg = sprintf("%s [%s] %d%% (%d/%d)", 
+                    $spin, $bar, $percent, $current, $total_sources);
+                
+                # Clear line and print
+                print "\r" . ' ' x 100 . "\r";  # Clear previous line
+                print BOLD . BLUE . "[*] " . RESET . "Passive enumeration: " . $progress_msg;
             }
         }
         
@@ -528,6 +649,1024 @@ sub query_shodan {
     return @subdomains;
 }
 
+sub query_securitytrails {
+    my ($domain) = @_;
+    my @subdomains;
+    
+    # Skip if no API key
+    return () unless $CONFIG{securitytrails_api_key};
+    
+    my $cache_key = "securitytrails_$domain";
+    if (my $cached = get_cache($cache_key)) {
+        return @$cached;
+    }
+    
+    my $ua = create_user_agent();
+    my $url = "https://api.securitytrails.com/v1/domain/$domain/subdomains";
+    
+    my $response = $ua->get($url, 'APIKEY' => $CONFIG{securitytrails_api_key});
+    return () unless $response->is_success;
+    
+    eval {
+        my $data = decode_json($response->decoded_content);
+        if ($data->{subdomains} && ref($data->{subdomains}) eq 'ARRAY') {
+            foreach my $sub (@{$data->{subdomains}}) {
+                push @subdomains, "$sub.$domain";
+            }
+        }
+    };
+    
+    @subdomains = unique(@subdomains);
+    set_cache($cache_key, \@subdomains);
+    return @subdomains;
+}
+
+sub query_bufferover {
+    my ($domain) = @_;
+    my @subdomains;
+    
+    my $cache_key = "bufferover_$domain";
+    if (my $cached = get_cache($cache_key)) {
+        return @$cached;
+    }
+    
+    my $ua = create_user_agent();
+    my $url = "https://dns.bufferover.run/dns?q=.$domain";
+    
+    my $response = $ua->get($url);
+    return () unless $response->is_success;
+    
+    eval {
+        my $data = decode_json($response->decoded_content);
+        if ($data->{FDNS_A} && ref($data->{FDNS_A}) eq 'ARRAY') {
+            foreach my $entry (@{$data->{FDNS_A}}) {
+                if ($entry =~ /,([a-zA-Z0-9\.\-]+\.\Q$domain\E)$/i) {
+                    push @subdomains, $1;
+                }
+            }
+        }
+    };
+    
+    @subdomains = unique(@subdomains);
+    set_cache($cache_key, \@subdomains);
+    return @subdomains;
+}
+
+sub query_urlscan {
+    my ($domain) = @_;
+    my @subdomains;
+    
+    my $cache_key = "urlscan_$domain";
+    if (my $cached = get_cache($cache_key)) {
+        return @$cached;
+    }
+    
+    my $ua = create_user_agent();
+    my $url = "https://urlscan.io/api/v1/search/?q=domain:$domain";
+    
+    my $response = $ua->get($url);
+    return () unless $response->is_success;
+    
+    eval {
+        my $data = decode_json($response->decoded_content);
+        if ($data->{results} && ref($data->{results}) eq 'ARRAY') {
+            foreach my $result (@{$data->{results}}) {
+                if ($result->{page} && $result->{page}->{domain}) {
+                    my $subdomain = $result->{page}->{domain};
+                    push @subdomains, $subdomain if $subdomain =~ /\Q$domain\E$/i;
+                }
+            }
+        }
+    };
+    
+    @subdomains = unique(@subdomains);
+    set_cache($cache_key, \@subdomains);
+    return @subdomains;
+}
+
+sub query_certspotter {
+    my ($domain) = @_;
+    my @subdomains;
+    
+    my $cache_key = "certspotter_$domain";
+    if (my $cached = get_cache($cache_key)) {
+        return @$cached;
+    }
+    
+    my $ua = create_user_agent();
+    my $url = "https://api.certspotter.com/v1/issuances?domain=$domain&include_subdomains=true&expand=dns_names";
+    
+    my $response = $ua->get($url);
+    return () unless $response->is_success;
+    
+    eval {
+        my $data = decode_json($response->decoded_content);
+        if (ref($data) eq 'ARRAY') {
+            foreach my $cert (@$data) {
+                if ($cert->{dns_names} && ref($cert->{dns_names}) eq 'ARRAY') {
+                    foreach my $name (@{$cert->{dns_names}}) {
+                        $name =~ s/^\*\.//;
+                        push @subdomains, $name if $name =~ /\Q$domain\E$/i;
+                    }
+                }
+            }
+        }
+    };
+    
+    @subdomains = unique(@subdomains);
+    set_cache($cache_key, \@subdomains);
+    return @subdomains;
+}
+
+sub query_anubis {
+    my ($domain) = @_;
+    my @subdomains;
+    
+    my $cache_key = "anubis_$domain";
+    if (my $cached = get_cache($cache_key)) {
+        return @$cached;
+    }
+    
+    my $ua = create_user_agent();
+    my $url = "https://jldc.me/anubis/subdomains/$domain";
+    
+    my $response = $ua->get($url);
+    return () unless $response->is_success;
+    
+    eval {
+        my $data = decode_json($response->decoded_content);
+        if (ref($data) eq 'ARRAY') {
+            @subdomains = @$data;
+        }
+    };
+    
+    @subdomains = unique(@subdomains);
+    set_cache($cache_key, \@subdomains);
+    return @subdomains;
+}
+
+sub query_threatminer {
+    my ($domain) = @_;
+    my @subdomains;
+    
+    my $cache_key = "threatminer_$domain";
+    if (my $cached = get_cache($cache_key)) {
+        return @$cached;
+    }
+    
+    my $ua = create_user_agent();
+    my $url = "https://api.threatminer.org/v2/domain.php?q=$domain&rt=5";
+    
+    my $response = $ua->get($url);
+    return () unless $response->is_success;
+    
+    eval {
+        my $data = decode_json($response->decoded_content);
+        if ($data->{results} && ref($data->{results}) eq 'ARRAY') {
+            @subdomains = @{$data->{results}};
+        }
+    };
+    
+    @subdomains = unique(@subdomains);
+    set_cache($cache_key, \@subdomains);
+    return @subdomains;
+}
+
+sub query_dnsdumpster {
+    my ($domain) = @_;
+    my @subdomains;
+    
+    my $cache_key = "dnsdumpster_$domain";
+    if (my $cached = get_cache($cache_key)) {
+        return @$cached;
+    }
+    
+    # DNSDumpster requires scraping, simplified version
+    my $ua = create_user_agent();
+    my $url = "https://dnsdumpster.com/";
+    
+    # Note: Full implementation would require CSRF token handling
+    # This is a placeholder that attempts basic access
+    eval {
+        my $response = $ua->get($url);
+        if ($response->is_success) {
+            my $content = $response->decoded_content;
+            # Extract subdomains from HTML (simplified)
+            while ($content =~ /([a-zA-Z0-9\-]+\.\Q$domain\E)/gi) {
+                push @subdomains, $1;
+            }
+        }
+    };
+    
+    @subdomains = unique(@subdomains);
+    set_cache($cache_key, \@subdomains);
+    return @subdomains;
+}
+
+sub query_rapiddns {
+    my ($domain) = @_;
+    my @subdomains;
+    
+    my $cache_key = "rapiddns_$domain";
+    if (my $cached = get_cache($cache_key)) {
+        return @$cached;
+    }
+    
+    my $ua = create_user_agent();
+    my $url = "https://rapiddns.io/subdomain/$domain?full=1";
+    
+    my $response = $ua->get($url);
+    return () unless $response->is_success;
+    
+    eval {
+        my $content = $response->decoded_content;
+        # Extract subdomains from HTML table
+        while ($content =~ /target="_blank">([a-zA-Z0-9\.\-]+\.\Q$domain\E)</gi) {
+            push @subdomains, $1;
+        }
+    };
+    
+    @subdomains = unique(@subdomains);
+    set_cache($cache_key, \@subdomains);
+    return @subdomains;
+}
+
+sub query_sublist3r {
+    my ($domain) = @_;
+    my @subdomains;
+    
+    my $cache_key = "sublist3r_$domain";
+    if (my $cached = get_cache($cache_key)) {
+        return @$cached;
+    }
+    
+    my $ua = create_user_agent();
+    my $url = "https://api.sublist3r.com/search.php?domain=$domain";
+    
+    my $response = $ua->get($url);
+    return () unless $response->is_success;
+    
+    eval {
+        my $data = decode_json($response->decoded_content);
+        if (ref($data) eq 'ARRAY') {
+            @subdomains = @$data;
+        }
+    };
+    
+    @subdomains = unique(@subdomains);
+    set_cache($cache_key, \@subdomains);
+    return @subdomains;
+}
+
+sub query_certdb {
+    my ($domain) = @_;
+    my @subdomains;
+    
+    my $cache_key = "certdb_$domain";
+    if (my $cached = get_cache($cache_key)) {
+        return @$cached;
+    }
+    
+    my $ua = create_user_agent();
+    my $url = "https://certdb.com/api/search?q=$domain";
+    
+    my $response = $ua->get($url);
+    return () unless $response->is_success;
+    
+    eval {
+        my $content = $response->decoded_content;
+        # Extract domains from response
+        while ($content =~ /"([a-zA-Z0-9\.\-]+\.\Q$domain\E)"/gi) {
+            my $subdomain = $1;
+            $subdomain =~ s/^\*\.//;
+            push @subdomains, $subdomain;
+        }
+    };
+    
+    @subdomains = unique(@subdomains);
+    set_cache($cache_key, \@subdomains);
+    return @subdomains;
+}
+
+sub query_chaos {
+    my ($domain) = @_;
+    my @subdomains;
+    
+    # Chaos by ProjectDiscovery - requires API key
+    return () unless $ENV{CHAOS_API_KEY};
+    
+    my $cache_key = "chaos_$domain";
+    if (my $cached = get_cache($cache_key)) {
+        return @$cached;
+    }
+    
+    my $ua = create_user_agent();
+    my $url = "https://dns.projectdiscovery.io/dns/$domain/subdomains";
+    
+    my $response = $ua->get($url, 'Authorization' => $ENV{CHAOS_API_KEY});
+    return () unless $response->is_success;
+    
+    eval {
+        my $data = decode_json($response->decoded_content);
+        if ($data->{subdomains} && ref($data->{subdomains}) eq 'ARRAY') {
+            foreach my $sub (@{$data->{subdomains}}) {
+                push @subdomains, "$sub.$domain";
+            }
+        }
+    };
+    
+    @subdomains = unique(@subdomains);
+    set_cache($cache_key, \@subdomains);
+    return @subdomains;
+}
+
+sub query_spyse {
+    my ($domain) = @_;
+    my @subdomains;
+    
+    # Spyse requires API key
+    return () unless $ENV{SPYSE_API_KEY};
+    
+    my $cache_key = "spyse_$domain";
+    if (my $cached = get_cache($cache_key)) {
+        return @$cached;
+    }
+    
+    my $ua = create_user_agent();
+    my $url = "https://api.spyse.com/v4/data/domain/subdomain?domain=$domain";
+    
+    my $response = $ua->get($url, 'Authorization' => "Bearer " . $ENV{SPYSE_API_KEY});
+    return () unless $response->is_success;
+    
+    eval {
+        my $data = decode_json($response->decoded_content);
+        if ($data->{data} && $data->{data}->{items} && ref($data->{data}->{items}) eq 'ARRAY') {
+            foreach my $item (@{$data->{data}->{items}}) {
+                if ($item->{name}) {
+                    push @subdomains, $item->{name};
+                }
+            }
+        }
+    };
+    
+    @subdomains = unique(@subdomains);
+    set_cache($cache_key, \@subdomains);
+    return @subdomains;
+}
+
+sub query_binaryedge {
+    my ($domain) = @_;
+    my @subdomains;
+    
+    # BinaryEdge requires API key
+    return () unless $ENV{BINARYEDGE_API_KEY};
+    
+    my $cache_key = "binaryedge_$domain";
+    if (my $cached = get_cache($cache_key)) {
+        return @$cached;
+    }
+    
+    my $ua = create_user_agent();
+    my $url = "https://api.binaryedge.io/v2/query/domains/subdomain/$domain";
+    
+    my $response = $ua->get($url, 'X-Key' => $ENV{BINARYEDGE_API_KEY});
+    return () unless $response->is_success;
+    
+    eval {
+        my $data = decode_json($response->decoded_content);
+        if ($data->{events} && ref($data->{events}) eq 'ARRAY') {
+            @subdomains = @{$data->{events}};
+        }
+    };
+    
+    @subdomains = unique(@subdomains);
+    set_cache($cache_key, \@subdomains);
+    return @subdomains;
+}
+
+sub query_censys {
+    my ($domain) = @_;
+    my @subdomains;
+    
+    # Censys requires API key
+    return () unless $ENV{CENSYS_API_ID} && $ENV{CENSYS_API_SECRET};
+    
+    my $cache_key = "censys_$domain";
+    if (my $cached = get_cache($cache_key)) {
+        return @$cached;
+    }
+    
+    my $ua = LWP::UserAgent->new(timeout => $CONFIG{timeout});
+    $ua->credentials('censys.io:443', 'Censys Search API', $ENV{CENSYS_API_ID}, $ENV{CENSYS_API_SECRET});
+    
+    my $url = "https://search.censys.io/api/v2/certificates/search?q=names:$domain";
+    
+    my $response = $ua->get($url);
+    return () unless $response->is_success;
+    
+    eval {
+        my $data = decode_json($response->decoded_content);
+        if ($data->{result} && $data->{result}->{hits} && ref($data->{result}->{hits}) eq 'ARRAY') {
+            foreach my $hit (@{$data->{result}->{hits}}) {
+                if ($hit->{names} && ref($hit->{names}) eq 'ARRAY') {
+                    foreach my $name (@{$hit->{names}}) {
+                        $name =~ s/^\*\.//;
+                        push @subdomains, $name if $name =~ /\Q$domain\E$/i;
+                    }
+                }
+            }
+        }
+    };
+    
+    @subdomains = unique(@subdomains);
+    set_cache($cache_key, \@subdomains);
+    return @subdomains;
+}
+
+sub query_fullhunt {
+    my ($domain) = @_;
+    my @subdomains;
+    
+    # FullHunt requires API key
+    return () unless $ENV{FULLHUNT_API_KEY};
+    
+    my $cache_key = "fullhunt_$domain";
+    if (my $cached = get_cache($cache_key)) {
+        return @$cached;
+    }
+    
+    my $ua = create_user_agent();
+    my $url = "https://fullhunt.io/api/v1/domain/$domain/subdomains";
+    
+    my $response = $ua->get($url, 'X-API-KEY' => $ENV{FULLHUNT_API_KEY});
+    return () unless $response->is_success;
+    
+    eval {
+        my $data = decode_json($response->decoded_content);
+        if ($data->{hosts} && ref($data->{hosts}) eq 'ARRAY') {
+            @subdomains = @{$data->{hosts}};
+        }
+    };
+    
+    @subdomains = unique(@subdomains);
+    set_cache($cache_key, \@subdomains);
+    return @subdomains;
+}
+
+sub query_netlas {
+    my ($domain) = @_;
+    my @subdomains;
+    
+    # Netlas requires API key
+    return () unless $ENV{NETLAS_API_KEY};
+    
+    my $cache_key = "netlas_$domain";
+    if (my $cached = get_cache($cache_key)) {
+        return @$cached;
+    }
+    
+    my $ua = create_user_agent();
+    my $url = "https://app.netlas.io/api/domains/?q=domain:*.$domain";
+    
+    my $response = $ua->get($url, 'X-API-Key' => $ENV{NETLAS_API_KEY});
+    return () unless $response->is_success;
+    
+    eval {
+        my $data = decode_json($response->decoded_content);
+        if ($data->{items} && ref($data->{items}) eq 'ARRAY') {
+            foreach my $item (@{$data->{items}}) {
+                if ($item->{data} && $item->{data}->{domain}) {
+                    push @subdomains, $item->{data}->{domain};
+                }
+            }
+        }
+    };
+    
+    @subdomains = unique(@subdomains);
+    set_cache($cache_key, \@subdomains);
+    return @subdomains;
+}
+
+sub query_leakix {
+    my ($domain) = @_;
+    my @subdomains;
+    
+    my $cache_key = "leakix_$domain";
+    if (my $cached = get_cache($cache_key)) {
+        return @$cached;
+    }
+    
+    my $ua = create_user_agent();
+    my $url = "https://leakix.net/api/subdomains/$domain";
+    
+    my $response = $ua->get($url);
+    return () unless $response->is_success;
+    
+    eval {
+        my $data = decode_json($response->decoded_content);
+        if (ref($data) eq 'ARRAY') {
+            foreach my $item (@$data) {
+                if ($item->{subdomain}) {
+                    push @subdomains, $item->{subdomain};
+                }
+            }
+        }
+    };
+    
+    @subdomains = unique(@subdomains);
+    set_cache($cache_key, \@subdomains);
+    return @subdomains;
+}
+
+sub query_fofa {
+    my ($domain) = @_;
+    my @subdomains;
+    
+    # Fofa requires API key
+    return () unless $ENV{FOFA_EMAIL} && $ENV{FOFA_API_KEY};
+    
+    my $cache_key = "fofa_$domain";
+    if (my $cached = get_cache($cache_key)) {
+        return @$cached;
+    }
+    
+    my $ua = create_user_agent();
+    my $query = "domain=\"$domain\"";
+    my $url = "https://fofa.info/api/v1/search/all?email=$ENV{FOFA_EMAIL}&key=$ENV{FOFA_API_KEY}&qbase64=" . encode_base64($query, '');
+    
+    my $response = $ua->get($url);
+    return () unless $response->is_success;
+    
+    eval {
+        my $data = decode_json($response->decoded_content);
+        if ($data->{results} && ref($data->{results}) eq 'ARRAY') {
+            foreach my $result (@{$data->{results}}) {
+                if ($result->[0] && $result->[0] =~ /([a-zA-Z0-9\.\-]+\.\Q$domain\E)/i) {
+                    push @subdomains, $1;
+                }
+            }
+        }
+    };
+    
+    @subdomains = unique(@subdomains);
+    set_cache($cache_key, \@subdomains);
+    return @subdomains;
+}
+
+sub query_zoomeye {
+    my ($domain) = @_;
+    my @subdomains;
+    
+    # ZoomEye requires API key
+    return () unless $ENV{ZOOMEYE_API_KEY};
+    
+    my $cache_key = "zoomeye_$domain";
+    if (my $cached = get_cache($cache_key)) {
+        return @$cached;
+    }
+    
+    my $ua = create_user_agent();
+    my $url = "https://api.zoomeye.org/domain/search?q=$domain&type=1";
+    
+    my $response = $ua->get($url, 'API-KEY' => $ENV{ZOOMEYE_API_KEY});
+    return () unless $response->is_success;
+    
+    eval {
+        my $data = decode_json($response->decoded_content);
+        if ($data->{list} && ref($data->{list}) eq 'ARRAY') {
+            foreach my $item (@{$data->{list}}) {
+                if ($item->{name}) {
+                    push @subdomains, $item->{name};
+                }
+            }
+        }
+    };
+    
+    @subdomains = unique(@subdomains);
+    set_cache($cache_key, \@subdomains);
+    return @subdomains;
+}
+
+sub query_hunter {
+    my ($domain) = @_;
+    my @subdomains;
+    
+    # Hunter requires API key
+    return () unless $ENV{HUNTER_API_KEY};
+    
+    my $cache_key = "hunter_$domain";
+    if (my $cached = get_cache($cache_key)) {
+        return @$cached;
+    }
+    
+    my $ua = create_user_agent();
+    my $url = "https://api.hunter.how/search?api-key=$ENV{HUNTER_API_KEY}&query=domain.suffix=\"$domain\"&page=1&page_size=100";
+    
+    my $response = $ua->get($url);
+    return () unless $response->is_success;
+    
+    eval {
+        my $data = decode_json($response->decoded_content);
+        if ($data->{data} && $data->{data}->{list} && ref($data->{data}->{list}) eq 'ARRAY') {
+            foreach my $item (@{$data->{data}->{list}}) {
+                if ($item->{domain}) {
+                    push @subdomains, $item->{domain};
+                }
+            }
+        }
+    };
+    
+    @subdomains = unique(@subdomains);
+    set_cache($cache_key, \@subdomains);
+    return @subdomains;
+}
+
+sub query_wayback {
+    my ($domain) = @_;
+    my @subdomains;
+    
+    my $cache_key = "wayback_$domain";
+    if (my $cached = get_cache($cache_key)) {
+        return @$cached;
+    }
+    
+    my $ua = create_user_agent();
+    my $url = "https://web.archive.org/cdx/search/cdx?url=*.$domain&output=json&fl=original&collapse=urlkey";
+    
+    my $response = $ua->get($url);
+    return () unless $response->is_success;
+    
+    eval {
+        my $data = decode_json($response->decoded_content);
+        if (ref($data) eq 'ARRAY') {
+            foreach my $entry (@$data) {
+                if (ref($entry) eq 'ARRAY' && $entry->[0]) {
+                    my $url = $entry->[0];
+                    if ($url =~ m{https?://([a-zA-Z0-9\.\-]+\.\Q$domain\E)}i) {
+                        push @subdomains, $1;
+                    }
+                }
+            }
+        }
+    };
+    
+    @subdomains = unique(@subdomains);
+    set_cache($cache_key, \@subdomains);
+    return @subdomains;
+}
+
+sub query_commoncrawl {
+    my ($domain) = @_;
+    my @subdomains;
+    
+    my $cache_key = "commoncrawl_$domain";
+    if (my $cached = get_cache($cache_key)) {
+        return @$cached;
+    }
+    
+    my $ua = create_user_agent();
+    my $url = "https://index.commoncrawl.org/CC-MAIN-2024-10-index?url=*.$domain&output=json";
+    
+    my $response = $ua->get($url);
+    return () unless $response->is_success;
+    
+    eval {
+        my $content = $response->decoded_content;
+        foreach my $line (split(/\n/, $content)) {
+            my $data = decode_json($line);
+            if ($data->{url} && $data->{url} =~ m{https?://([a-zA-Z0-9\.\-]+\.\Q$domain\E)}i) {
+                push @subdomains, $1;
+            }
+        }
+    };
+    
+    @subdomains = unique(@subdomains);
+    set_cache($cache_key, \@subdomains);
+    return @subdomains;
+}
+
+sub query_github {
+    my ($domain) = @_;
+    my @subdomains;
+    
+    # GitHub search (optional API key for higher rate limits)
+    my $cache_key = "github_$domain";
+    if (my $cached = get_cache($cache_key)) {
+        return @$cached;
+    }
+    
+    my $ua = create_user_agent();
+    my $url = "https://api.github.com/search/code?q=$domain&per_page=100";
+    
+    my @headers = ();
+    if ($ENV{GITHUB_TOKEN}) {
+        push @headers, 'Authorization' => "token $ENV{GITHUB_TOKEN}";
+    }
+    
+    my $response = $ua->get($url, @headers);
+    return () unless $response->is_success;
+    
+    eval {
+        my $data = decode_json($response->decoded_content);
+        if ($data->{items} && ref($data->{items}) eq 'ARRAY') {
+            foreach my $item (@{$data->{items}}) {
+                # This would require fetching file contents
+                # Simplified version just extracts from available data
+                if ($item->{name} && $item->{name} =~ /([a-zA-Z0-9\.\-]+\.\Q$domain\E)/i) {
+                    push @subdomains, $1;
+                }
+            }
+        }
+    };
+    
+    @subdomains = unique(@subdomains);
+    set_cache($cache_key, \@subdomains);
+    return @subdomains;
+}
+
+sub query_crtsh_alt {
+    my ($domain) = @_;
+    my @subdomains;
+    
+    my $cache_key = "crtsh_alt_$domain";
+    if (my $cached = get_cache($cache_key)) {
+        return @$cached;
+    }
+    
+    my $ua = create_user_agent();
+    my $url = "https://crt.sh/?q=$domain";
+    
+    my $response = $ua->get($url);
+    return () unless $response->is_success;
+    
+    my $content = $response->decoded_content;
+    while ($content =~ /<TD>([a-zA-Z0-9\*\.\-]+\.\Q$domain\E)<\/TD>/gi) {
+        my $subdomain = $1;
+        $subdomain =~ s/^\*\.//;
+        push @subdomains, $subdomain;
+    }
+    
+    @subdomains = unique(@subdomains);
+    set_cache($cache_key, \@subdomains);
+    return @subdomains;
+}
+
+sub query_sonar {
+    my ($domain) = @_;
+    my @subdomains;
+    
+    my $cache_key = "sonar_$domain";
+    if (my $cached = get_cache($cache_key)) {
+        return @$cached;
+    }
+    
+    my $ua = create_user_agent();
+    my $url = "https://sonar.omnisint.io/subdomains/$domain";
+    
+    my $response = $ua->get($url);
+    return () unless $response->is_success;
+    
+    eval {
+        my $data = decode_json($response->decoded_content);
+        if (ref($data) eq 'ARRAY') {
+            @subdomains = @$data;
+        }
+    };
+    
+    @subdomains = unique(@subdomains);
+    set_cache($cache_key, \@subdomains);
+    return @subdomains;
+}
+
+sub query_omnisint {
+    my ($domain) = @_;
+    my @subdomains;
+    
+    my $cache_key = "omnisint_$domain";
+    if (my $cached = get_cache($cache_key)) {
+        return @$cached;
+    }
+    
+    my $ua = create_user_agent();
+    my $url = "https://sonar.omnisint.io/all/$domain";
+    
+    my $response = $ua->get($url);
+    return () unless $response->is_success;
+    
+    eval {
+        my $content = $response->decoded_content;
+        foreach my $line (split(/\n/, $content)) {
+            if ($line =~ /([a-zA-Z0-9\.\-]+\.\Q$domain\E)/i) {
+                push @subdomains, $1;
+            }
+        }
+    };
+    
+    @subdomains = unique(@subdomains);
+    set_cache($cache_key, \@subdomains);
+    return @subdomains;
+}
+
+sub query_projectdiscovery {
+    my ($domain) = @_;
+    my @subdomains;
+    
+    my $cache_key = "projectdiscovery_$domain";
+    if (my $cached = get_cache($cache_key)) {
+        return @$cached;
+    }
+    
+    my $ua = create_user_agent();
+    my $url = "https://dns.projectdiscovery.io/dns/$domain";
+    
+    my $response = $ua->get($url);
+    return () unless $response->is_success;
+    
+    eval {
+        my $content = $response->decoded_content;
+        foreach my $line (split(/\n/, $content)) {
+            chomp $line;
+            push @subdomains, $line if $line =~ /\Q$domain\E$/i;
+        }
+    };
+    
+    @subdomains = unique(@subdomains);
+    set_cache($cache_key, \@subdomains);
+    return @subdomains;
+}
+
+sub query_rapiddns_io {
+    my ($domain) = @_;
+    my @subdomains;
+    
+    my $cache_key = "rapiddns_io_$domain";
+    if (my $cached = get_cache($cache_key)) {
+        return @$cached;
+    }
+    
+    my $ua = create_user_agent();
+    my $url = "https://rapiddns.io/s/$domain?full=1#result";
+    
+    my $response = $ua->get($url);
+    return () unless $response->is_success;
+    
+    my $content = $response->decoded_content;
+    while ($content =~ /">([a-zA-Z0-9\.\-]+\.\Q$domain\E)</gi) {
+        push @subdomains, $1;
+    }
+    
+    @subdomains = unique(@subdomains);
+    set_cache($cache_key, \@subdomains);
+    return @subdomains;
+}
+
+sub query_dns_bufferover {
+    my ($domain) = @_;
+    my @subdomains;
+    
+    my $cache_key = "dns_bufferover_$domain";
+    if (my $cached = get_cache($cache_key)) {
+        return @$cached;
+    }
+    
+    my $ua = create_user_agent();
+    my $url = "https://tls.bufferover.run/dns?q=.$domain";
+    
+    my $response = $ua->get($url);
+    return () unless $response->is_success;
+    
+    eval {
+        my $data = decode_json($response->decoded_content);
+        if ($data->{Results} && ref($data->{Results}) eq 'ARRAY') {
+            foreach my $entry (@{$data->{Results}}) {
+                if ($entry =~ /,([a-zA-Z0-9\.\-]+\.\Q$domain\E)$/i) {
+                    push @subdomains, $1;
+                }
+            }
+        }
+    };
+    
+    @subdomains = unique(@subdomains);
+    set_cache($cache_key, \@subdomains);
+    return @subdomains;
+}
+
+sub query_certificatesearch {
+    my ($domain) = @_;
+    my @subdomains;
+    
+    my $cache_key = "certificatesearch_$domain";
+    if (my $cached = get_cache($cache_key)) {
+        return @$cached;
+    }
+    
+    my $ua = create_user_agent();
+    my $url = "https://certificatedetails.com/$domain";
+    
+    my $response = $ua->get($url);
+    return () unless $response->is_success;
+    
+    my $content = $response->decoded_content;
+    while ($content =~ /([a-zA-Z0-9\.\-]+\.\Q$domain\E)/gi) {
+        my $subdomain = $1;
+        $subdomain =~ s/^\*\.//;
+        push @subdomains, $subdomain;
+    }
+    
+    @subdomains = unique(@subdomains);
+    set_cache($cache_key, \@subdomains);
+    return @subdomains;
+}
+
+sub query_crtsh_json {
+    my ($domain) = @_;
+    my @subdomains;
+    
+    my $cache_key = "crtsh_json_$domain";
+    if (my $cached = get_cache($cache_key)) {
+        return @$cached;
+    }
+    
+    my $ua = create_user_agent();
+    my $url = "https://crt.sh/?q=$domain&output=json";
+    
+    my $response = $ua->get($url);
+    return () unless $response->is_success;
+    
+    eval {
+        my $data = decode_json($response->decoded_content);
+        if (ref($data) eq 'ARRAY') {
+            foreach my $cert (@$data) {
+                if ($cert->{common_name}) {
+                    my $name = $cert->{common_name};
+                    $name =~ s/^\*\.//;
+                    push @subdomains, $name if $name =~ /\Q$domain\E$/i;
+                }
+            }
+        }
+    };
+    
+    @subdomains = unique(@subdomains);
+    set_cache($cache_key, \@subdomains);
+    return @subdomains;
+}
+
+sub query_webarchive {
+    my ($domain) = @_;
+    my @subdomains;
+    
+    my $cache_key = "webarchive_$domain";
+    if (my $cached = get_cache($cache_key)) {
+        return @$cached;
+    }
+    
+    my $ua = create_user_agent();
+    my $url = "https://web.archive.org/web/*/http://*.$domain/*";
+    
+    my $response = $ua->get($url);
+    return () unless $response->is_success;
+    
+    my $content = $response->decoded_content;
+    while ($content =~ m{https?://([a-zA-Z0-9\.\-]+\.\Q$domain\E)}gi) {
+        push @subdomains, $1;
+    }
+    
+    @subdomains = unique(@subdomains);
+    set_cache($cache_key, \@subdomains);
+    return @subdomains;
+}
+
+sub query_virustotal_web {
+    my ($domain) = @_;
+    my @subdomains;
+    
+    my $cache_key = "virustotal_web_$domain";
+    if (my $cached = get_cache($cache_key)) {
+        return @$cached;
+    }
+    
+    my $ua = create_user_agent();
+    my $url = "https://www.virustotal.com/ui/domains/$domain/subdomains?limit=40";
+    
+    my $response = $ua->get($url);
+    return () unless $response->is_success;
+    
+    eval {
+        my $data = decode_json($response->decoded_content);
+        if ($data->{data} && ref($data->{data}) eq 'ARRAY') {
+            foreach my $entry (@{$data->{data}}) {
+                if ($entry->{id}) {
+                    push @subdomains, $entry->{id};
+                }
+            }
+        }
+    };
+    
+    @subdomains = unique(@subdomains);
+    set_cache($cache_key, \@subdomains);
+    return @subdomains;
+}
+
 ################################################################################
 # DNS Brute-force
 ################################################################################
@@ -660,6 +1799,176 @@ sub is_wildcard_multi {
     }
     
     return 0;
+}
+
+sub attempt_zone_transfer {
+    my ($domain) = @_;
+    my @subdomains;
+    
+    return () unless $CONFIG{zone_transfer};
+    
+    log_verbose("Attempting zone transfer (AXFR)...");
+    
+    # Get NS records
+    my $query = $dns_resolver->query($domain, 'NS');
+    return () unless $query;
+    
+    foreach my $rr ($query->answer) {
+        next unless $rr->type eq 'NS';
+        my $nameserver = $rr->nsdname;
+        
+        log_verbose("  Trying nameserver: $nameserver");
+        
+        # Create resolver for this specific nameserver
+        my $axfr_resolver = Net::DNS::Resolver->new(
+            nameservers => [$nameserver],
+            tcp_timeout => $CONFIG{timeout},
+        );
+        
+        eval {
+            my @zone = $axfr_resolver->axfr($domain);
+            foreach my $record (@zone) {
+                if ($record->name =~ /\Q$domain\E$/i) {
+                    push @subdomains, $record->name;
+                }
+            }
+        };
+        
+        if (@subdomains) {
+            log_success("Zone transfer successful from $nameserver!");
+            last;
+        }
+    }
+    
+    return unique(@subdomains);
+}
+
+sub probe_http {
+    my ($subdomain) = @_;
+    
+    return unless $CONFIG{http_probe};
+    
+    my $ua = LWP::UserAgent->new(
+        timeout => 5,
+        max_redirect => 0,
+        ssl_opts => { verify_hostname => 0 },
+    );
+    
+    foreach my $proto ('https', 'http') {
+        my $url = "$proto://$subdomain";
+        
+        eval {
+            my $response = $ua->get($url);
+            if ($response) {
+                $http_status{$subdomain} = {
+                    protocol => $proto,
+                    status   => $response->code,
+                    title    => extract_title($response->decoded_content),
+                };
+                log_verbose("  HTTP $proto://$subdomain -> " . $response->code);
+                last;
+            }
+        };
+    }
+}
+
+sub extract_title {
+    my ($html) = @_;
+    
+    return '' unless $html;
+    
+    if ($html =~ /<title[^>]*>([^<]+)<\/title>/i) {
+        my $title = $1;
+        $title =~ s/^\s+|\s+$//g;
+        return substr($title, 0, 50);
+    }
+    
+    return '';
+}
+
+sub check_subdomain_takeover {
+    my ($subdomain) = @_;
+    
+    return unless $CONFIG{takeover_check};
+    
+    # Common takeover signatures
+    my %signatures = (
+        'github.io' => {
+            cname => 'github.io',
+            response => 'There isn\'t a GitHub Pages site here',
+        },
+        'herokuapp.com' => {
+            cname => 'herokuapp.com',
+            response => 'No such app',
+        },
+        'amazonaws.com' => {
+            cname => 'amazonaws.com',
+            response => 'NoSuchBucket',
+        },
+        'azurewebsites.net' => {
+            cname => 'azurewebsites.net',
+            response => '404 Web Site not found',
+        },
+        'cloudfront.net' => {
+            cname => 'cloudfront.net',
+            response => 'Bad request',
+        },
+    );
+    
+    # Check CNAME
+    my $query = $dns_resolver->query($subdomain, 'CNAME');
+    return unless $query;
+    
+    foreach my $rr ($query->answer) {
+        next unless $rr->type eq 'CNAME';
+        my $cname = $rr->cname;
+        
+        foreach my $service (keys %signatures) {
+            if ($cname =~ /\Q$service\E$/i) {
+                # Check HTTP response
+                my $ua = create_user_agent();
+                
+                eval {
+                    my $response = $ua->get("http://$subdomain");
+                    if ($response && $response->decoded_content =~ /$signatures{$service}{response}/i) {
+                        $takeover_vulnerable{$subdomain} = {
+                            service => $service,
+                            cname   => $cname,
+                        };
+                        log_warning("Potential takeover: $subdomain -> $cname");
+                    }
+                };
+            }
+        }
+    }
+}
+
+sub recursive_enumeration {
+    my ($domain, $depth) = @_;
+    
+    return unless $CONFIG{recursive};
+    return if $depth <= 0;
+    
+    log_verbose("Recursive enumeration (depth $depth) for $domain");
+    
+    my @found_subdomains = keys %results;
+    
+    foreach my $subdomain (@found_subdomains) {
+        return if $interrupted;
+        
+        # Try common patterns
+        my @patterns = qw(www dev staging test api admin portal);
+        
+        foreach my $pattern (@patterns) {
+            my $new_subdomain = "$pattern.$subdomain";
+            
+            if (my $ip = resolve_dns($new_subdomain)) {
+                unless (is_wildcard($ip)) {
+                    add_result($new_subdomain, $ip);
+                }
+            }
+        }
+    }
 }
 
 ################################################################################
@@ -965,8 +2274,14 @@ OPTIONS:
     --resolvers <list>          Comma-separated DNS resolvers
     --rate-limit <num>          API rate limit per second (default: 10)
     --record-types <types>      DNS record types to query: A,AAAA,CNAME,MX,NS,TXT,SOA (default: A)
+    -r, --recursive             Enable recursive subdomain discovery
+    --recursion-depth <num>     Recursion depth (default: 3)
+    -z, --zone-transfer         Attempt DNS zone transfer (AXFR)
+    --http-probe                Probe HTTP/HTTPS services
+    --takeover-check            Check for subdomain takeover vulnerabilities
     --shodan-key <key>          Shodan API key (or use SHODAN_API_KEY env)
     --virustotal-key <key>      VirusTotal API key (or use VIRUSTOTAL_API_KEY env)
+    --securitytrails-key <key>  SecurityTrails API key (or use SECURITYTRAILS_API_KEY env)
     -h, --help                  Show this help message
     --version                   Show version
 
@@ -977,6 +2292,9 @@ EXAMPLES:
     dnx -d example.com --passive
     dnx -d example.com --no-bruteforce
     dnx -d example.com --record-types A,AAAA,MX
+    dnx -d example.com --recursive --recursion-depth 2
+    dnx -d example.com --zone-transfer --http-probe
+    dnx -d example.com --takeover-check
     dnx -d example.com --shodan-key YOUR_KEY --virustotal-key YOUR_KEY
 
 CONFIG FILE:
@@ -986,16 +2304,34 @@ CACHE:
     ~/.dnx/cache/
 
 NOTES:
-    - Passive sources: crt.sh, HackerTarget, ThreatCrowd, AlienVault OTX, Riddler.io
-    - Optional sources (require API keys): VirusTotal, Shodan
+    - 40 passive enumeration sources for maximum coverage!
+    - Free sources (27): crt.sh, HackerTarget, ThreatCrowd, AlienVault OTX, Riddler.io,
+      BufferOver, URLScan, CertSpotter, Anubis, ThreatMiner, DNSDumpster, RapidDNS,
+      Sublist3r, CertDB, LeakIX, Wayback Machine, CommonCrawl, Crtsh Alt, Sonar,
+      Omnisint, ProjectDiscovery, Rapiddns.io, DNS.BufferOver, CertificateSearch,
+      Crt.sh JSON, Web Archive, VirusTotal Web
+    - API key sources (13): VirusTotal, Shodan, SecurityTrails, Chaos, Spyse, BinaryEdge,
+      Censys, FullHunt, Netlas, Fofa, ZoomEye, Hunter, GitHub
     - Wildcard DNS is automatically detected and filtered
     - Results are cached for 24 hours to reduce API load
     - Use --verbose to see detailed enumeration progress
     
-API KEYS:
-    Set via environment variables or command-line options:
-    export SHODAN_API_KEY="your_key_here"
-    export VIRUSTOTAL_API_KEY="your_key_here"
+API KEYS (Optional - for enhanced results):
+    export SHODAN_API_KEY="your_key"
+    export VIRUSTOTAL_API_KEY="your_key"
+    export SECURITYTRAILS_API_KEY="your_key"
+    export CHAOS_API_KEY="your_key"
+    export SPYSE_API_KEY="your_key"
+    export BINARYEDGE_API_KEY="your_key"
+    export CENSYS_API_ID="your_id"
+    export CENSYS_API_SECRET="your_secret"
+    export FULLHUNT_API_KEY="your_key"
+    export NETLAS_API_KEY="your_key"
+    export FOFA_EMAIL="your_email"
+    export FOFA_API_KEY="your_key"
+    export ZOOMEYE_API_KEY="your_key"
+    export HUNTER_API_KEY="your_key"
+    export GITHUB_TOKEN="your_token"
 };
 }
 

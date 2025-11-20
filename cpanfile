@@ -13,6 +13,7 @@ requires 'Time::HiRes';
 requires 'File::Path';
 requires 'File::Spec';
 requires 'Digest::MD5';
+requires 'MIME::Base64';
 requires 'Socket';
 requires 'POSIX';
 

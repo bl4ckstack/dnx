@@ -5,15 +5,14 @@ A production-ready subdomain enumeration tool written in Perl for security resea
 ## Features
 
 ### Core Capabilities
-- **Passive Enumeration**: Query multiple public APIs without touching the target
-  - crt.sh (Certificate Transparency logs)
-  - HackerTarget
-  - ThreatCrowd
-  - AlienVault OTX
-  - Riddler.io
-  - VirusTotal (requires API key)
-  - Shodan (requires API key)
+- **Passive Enumeration**: Query **40 public APIs** for maximum coverage
+  - **Free (27)**: crt.sh, HackerTarget, ThreatCrowd, AlienVault OTX, Riddler.io, BufferOver, URLScan, CertSpotter, Anubis, ThreatMiner, DNSDumpster, RapidDNS, Sublist3r, CertDB, LeakIX, Wayback Machine, CommonCrawl, Crtsh Alt, Sonar, Omnisint, ProjectDiscovery, Rapiddns.io, DNS.BufferOver, CertificateSearch, Crt.sh JSON, Web Archive, VirusTotal Web
+  - **API Key (13)**: VirusTotal, Shodan, SecurityTrails, Chaos, Spyse, BinaryEdge, Censys, FullHunt, Netlas, Fofa, ZoomEye, Hunter, GitHub
+- **Recursive Discovery**: Automatically discover subdomains of found subdomains
+- **DNS Zone Transfer**: Attempt AXFR for misconfigured DNS servers
 - **Active Brute-Force**: Parallel DNS resolution with wordlist support
+- **HTTP Probing**: Test HTTP/HTTPS availability and extract page titles
+- **Subdomain Takeover Detection**: Identify vulnerable subdomains (GitHub, AWS, Azure, etc.)
 - **Wildcard Detection**: Automatically detect and filter wildcard DNS responses
 - **DNS Resolver Rotation**: Distribute queries across multiple resolvers
 - **Smart Caching**: Cache API results for 24 hours to reduce load
@@ -151,11 +150,23 @@ make help         # Show all targets
 # Query multiple DNS record types
 ./dnx -d example.com --record-types A,AAAA,MX,NS
 
+# Recursive subdomain discovery
+./dnx -d example.com --recursive --recursion-depth 2
+
+# Attempt DNS zone transfer
+./dnx -d example.com --zone-transfer
+
+# HTTP probing with takeover detection
+./dnx -d example.com --http-probe --takeover-check
+
+# Comprehensive scan with all features
+./dnx -d example.com -w subdomains.txt --recursive --http-probe --takeover-check
+
 # Domain with URL (auto-parsed)
 ./dnx -d https://example.com/path --passive
 
 # Use API keys for enhanced results
-./dnx -d example.com --shodan-key YOUR_KEY --virustotal-key YOUR_KEY
+./dnx -d example.com --shodan-key YOUR_KEY --virustotal-key YOUR_KEY --securitytrails-key YOUR_KEY
 ```
 
 ## Command-Line Options
@@ -175,8 +186,14 @@ make help         # Show all targets
 | `--resolvers` | Comma-separated DNS resolvers | 8.8.8.8,8.8.4.4,1.1.1.1,1.0.0.1 |
 | `--rate-limit` | API requests per second | 10 |
 | `--record-types` | DNS record types (A,AAAA,CNAME,MX,NS,TXT,SOA) | A |
+| `-r, --recursive` | Enable recursive subdomain discovery | false |
+| `--recursion-depth` | Recursion depth | 3 |
+| `-z, --zone-transfer` | Attempt DNS zone transfer (AXFR) | false |
+| `--http-probe` | Probe HTTP/HTTPS services | false |
+| `--takeover-check` | Check for subdomain takeovers | false |
 | `--shodan-key` | Shodan API key | - |
 | `--virustotal-key` | VirusTotal API key | - |
+| `--securitytrails-key` | SecurityTrails API key | - |
 | `-h, --help` | Show help message | - |
 | `--version` | Show version | - |
 
@@ -198,6 +215,40 @@ format = text
 # shodan_api_key = YOUR_KEY_HERE
 # virustotal_api_key = YOUR_KEY_HERE
 ```
+
+## Advanced Features
+
+### Recursive Subdomain Discovery
+Automatically discover subdomains of found subdomains:
+```bash
+./dnx -d example.com --recursive --recursion-depth 2
+```
+This will find subdomains like `dev.api.example.com` if `api.example.com` is discovered.
+
+### DNS Zone Transfer (AXFR)
+Attempt zone transfer from DNS servers (works on misconfigured servers):
+```bash
+./dnx -d example.com --zone-transfer
+```
+
+### HTTP Probing
+Test HTTP/HTTPS availability and extract page titles:
+```bash
+./dnx -d example.com --http-probe
+```
+Results include HTTP status codes and page titles.
+
+### Subdomain Takeover Detection
+Identify potentially vulnerable subdomains:
+```bash
+./dnx -d example.com --takeover-check
+```
+Detects common takeover scenarios:
+- GitHub Pages
+- Heroku
+- AWS S3
+- Azure
+- CloudFront
 
 ## API Keys (Optional)
 
@@ -221,6 +272,106 @@ export VIRUSTOTAL_API_KEY="your_key_here"
 export SHODAN_API_KEY="your_key_here"
 # Or use --shodan-key flag
 ./dnx -d example.com --shodan-key "your_key_here"
+```
+
+### SecurityTrails
+1. Sign up at https://securitytrails.com/
+2. Get your API key from your account settings
+3. Set via environment variable:
+```bash
+export SECURITYTRAILS_API_KEY="your_key_here"
+./dnx -d example.com --securitytrails-key "your_key_here"
+```
+
+### Chaos (ProjectDiscovery)
+1. Sign up at https://chaos.projectdiscovery.io/
+2. Get your API key
+3. Set via environment variable:
+```bash
+export CHAOS_API_KEY="your_key_here"
+./dnx -d example.com
+```
+
+### Spyse
+1. Sign up at https://spyse.com/
+2. Get your API key from account settings
+3. Set via environment variable:
+```bash
+export SPYSE_API_KEY="your_key_here"
+./dnx -d example.com
+```
+
+### BinaryEdge
+1. Sign up at https://www.binaryedge.io/
+2. Get your API key from account page
+3. Set via environment variable:
+```bash
+export BINARYEDGE_API_KEY="your_key_here"
+./dnx -d example.com
+```
+
+### Censys
+1. Sign up at https://censys.io/
+2. Get API credentials from account settings
+3. Set via environment variables:
+```bash
+export CENSYS_API_ID="your_api_id"
+export CENSYS_API_SECRET="your_api_secret"
+./dnx -d example.com
+```
+
+### FullHunt
+1. Sign up at https://fullhunt.io/
+2. Get your API key
+3. Set via environment variable:
+```bash
+export FULLHUNT_API_KEY="your_key_here"
+./dnx -d example.com
+```
+
+### Netlas
+1. Sign up at https://netlas.io/
+2. Get your API key
+3. Set via environment variable:
+```bash
+export NETLAS_API_KEY="your_key_here"
+./dnx -d example.com
+```
+
+### Fofa
+1. Sign up at https://fofa.info/
+2. Get your API credentials
+3. Set via environment variables:
+```bash
+export FOFA_EMAIL="your_email"
+export FOFA_API_KEY="your_key_here"
+./dnx -d example.com
+```
+
+### ZoomEye
+1. Sign up at https://www.zoomeye.org/
+2. Get your API key
+3. Set via environment variable:
+```bash
+export ZOOMEYE_API_KEY="your_key_here"
+./dnx -d example.com
+```
+
+### Hunter
+1. Sign up at https://hunter.how/
+2. Get your API key
+3. Set via environment variable:
+```bash
+export HUNTER_API_KEY="your_key_here"
+./dnx -d example.com
+```
+
+### GitHub (Optional)
+1. Create a personal access token at https://github.com/settings/tokens
+2. Set via environment variable for higher rate limits:
+```bash
+export GITHUB_TOKEN="your_token_here"
+./dnx -d example.com
 ```
 
 ## Output Formats
@@ -359,18 +510,51 @@ A sample wordlist (`subdomains.txt`) is included with common subdomain names. Fo
 
 ## API Sources
 
-DNX queries the following APIs:
+DNX queries **40 different APIs** for maximum subdomain coverage:
 
-### Free (No API Key Required)
+### Free Sources (No API Key Required)
 1. **crt.sh** - Certificate Transparency logs
-2. **HackerTarget** - Free API (limited requests)
+2. **HackerTarget** - DNS reconnaissance
 3. **ThreatCrowd** - Threat intelligence
 4. **AlienVault OTX** - Open Threat Exchange
 5. **Riddler.io** - DNS database
+6. **BufferOver** - DNS data aggregator
+7. **URLScan** - URL scanning service
+8. **CertSpotter** - Certificate monitoring
+9. **Anubis** - Subdomain enumeration
+10. **ThreatMiner** - Threat intelligence
+11. **DNSDumpster** - DNS recon tool
+12. **RapidDNS** - DNS query tool
+13. **Sublist3r API** - Subdomain discovery
+14. **CertDB** - Certificate database
+15. **LeakIX** - Leak detection
+16. **Wayback Machine** - Internet Archive
+17. **CommonCrawl** - Web crawl data
+18. **Crtsh Alt** - Alternative crt.sh parser
+19. **Sonar** - Omnisint Sonar project
+20. **Omnisint** - Open source intelligence
+21. **ProjectDiscovery** - Chaos dataset (free tier)
+22. **Rapiddns.io** - Alternative RapidDNS
+23. **DNS.BufferOver** - TLS BufferOver
+24. **CertificateSearch** - Certificate details
+25. **Crt.sh JSON** - JSON endpoint
+26. **Web Archive** - Archive.org crawler
+27. **VirusTotal Web** - Web interface scraper
 
-### Premium (API Key Required)
-6. **VirusTotal** - Comprehensive subdomain data
-7. **Shodan** - Internet-wide scanning data
+### Premium Sources (API Key Required)
+18. **VirusTotal** - Comprehensive subdomain data
+19. **Shodan** - Internet-wide scanning
+20. **SecurityTrails** - Historical DNS data
+21. **Chaos** - ProjectDiscovery dataset
+22. **Spyse** - Internet assets search
+23. **BinaryEdge** - Internet scanning platform
+24. **Censys** - Internet-wide search engine
+25. **FullHunt** - Attack surface discovery
+26. **Netlas** - Internet data platform
+27. **Fofa** - Cyberspace search engine
+28. **ZoomEye** - Cyberspace search engine
+29. **Hunter** - Internet assets hunter
+30. **GitHub** - Code search (optional token)
 
 ### API Rate Limiting
 
@@ -415,7 +599,7 @@ MIT License - see LICENSE file for details
 
 ### v1.0.0 (2025-11-19)
 - Initial release
-- Passive enumeration via 5 public APIs
+- Passive enumeration via 10 public APIs
 - Parallel DNS brute-force
 - Wildcard detection
 - Multiple output formats
